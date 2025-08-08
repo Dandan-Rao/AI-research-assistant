@@ -8,6 +8,7 @@ import panel as pn  # GUI
 # Load Panel's interactive features
 pn.extension()
 
+# Set openai api key
 openai.api_key  = os.environ['OPENAI_API_KEY']
 if openai.api_key is None:
     raise ValueError("OPENAI_API_KEY is not set in environment variables.")
@@ -17,37 +18,44 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS # A more persistent vector store option
 from langchain.chains import ConversationalRetrievalChain
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, UnstructuredWordDocumentLoader, WebBaseLoader
-
 from langchain_openai import ChatOpenAI
+from langchain_community.vectorstores import Chroma
 import shutil
+CHAIN_TYPE = "stuff"  # Default chain type for ConversationalRetrievalChain
 
-
+# Ignore warnings
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic._migration")
 
+# Set the openai chat model name
 llm_name = 'gpt-4o-mini'
 # define embedding
-embeddings = OpenAIEmbeddings()
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+embeddings = OpenAIEmbeddings(model = "text-embedding-3-small")
+# Define text splitter. Splitting text into smaller chunks while maintaining the context. RecursiveCharacterTextSplitter is recommended for generic text.
+# 1000-1500 is a moderate chunk_size. The chunk size is 1024, which is a good balance between speed and accuracy.
+# Seperate by paragraphs, lines, setences, spaces, and empty strings.
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1024, chunk_overlap=96) # The default list is ["\n\n", "\n", " ", ""]
 
-# Global variable
-# db = None
-DB_PATH = os.path.join(".", "vector_store", "faiss_index")
-# not only the path exist but it is not empty
-if os.path.exists(DB_PATH) and os.listdir(DB_PATH):
-    db = FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
-    # db is a FAISS index, highly optimized vector search database used for similarity searches.
-else:
-    if os.path.exists(os.path.join(".", "vector_store")):
-        os.makedirs(DB_PATH, exist_ok=True)
-    else:
-        os.mkdir(os.path.join(".", "vector_store"))
-        os.makedirs(DB_PATH, exist_ok=True)
-    db = None
+# Initialize the vector store
+DB_PATH = os.path.join(".", "docs", "chroma") 
+if not os.path.exists(DB_PATH):
+    os.makedirs(DB_PATH)
+vectordb = Chroma(
+    collection_name = 'Self-Assistant',
+    persist_directory=DB_PATH,  # Where to save data locally
+    embedding_function=embeddings
+    )
+retriever = vectordb.as_retriever(search_type="similarity", search_kwargs={"k": 4})  # Default to 4 results
 
-def load_db(file_path, chain_type, k):
-    global db  # Ensure db persists
-    if file_path.endswith(".pdf"):
+def load_db(file_path):
+    '''
+    Load the file, split the text, add document to a vector store, save the vector store, and create a chatbot chain.
+    '''
+    # global db  # Ensure db persists
+    # Load the document
+    if not file_path:
+        return
+    elif file_path.endswith(".pdf"):
         document = PyPDFLoader(file_path).load()
     elif file_path.endswith(".txt"):
         document = TextLoader(file_path).load()
@@ -56,73 +64,51 @@ def load_db(file_path, chain_type, k):
     elif file_path.startswith("http"):
         document = WebBaseLoader(file_path).load()
     else:
-        document = []
+        print(f"Error loading file {file_path}: Unsupported file type.")
+        return
 
     # split documents
     docs = text_splitter.split_documents(document)
 
-    # Create a persistent in-memory vector database
-    if os.path.exists(DB_PATH) and os.listdir(DB_PATH):
-        db = FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
-        db.add_documents(docs)  # Add new documents
-        # db.save_local(DB_PATH)  # Save updated DB
-        
-    else:
-        db = FAISS.from_documents(docs, embeddings)
+    # Add documents to the vector store if they exist
+    if docs:
+        vectordb.add_documents(docs)  # Add new documents
+        # vectordb.persist()  # ensures that new data is stored in DB_PATH
 
-    db.save_local(DB_PATH)  # Save to disk
-    
-    # define retriever
-    retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": k})
-    
-    # create a chatbot chain. Memory is managed externally.
-    chatbot_chain = ConversationalRetrievalChain.from_llm(
-            llm=ChatOpenAI(model_name=llm_name, temperature=0), 
-            chain_type=chain_type, 
-            retriever=retriever, 
-            return_source_documents=True,
-            return_generated_question=True,
-        )
-    
-    return chatbot_chain 
 
 # create classes with dynamic parameters
 class cbfs(param.Parameterized): 
+    '''
+    Chatbot for files and web links
+    '''
     chat_history = param.List([])
     answer = param.String("")
     db_query  = param.String("")
     db_response = param.List([])
-    
-    def __init__(self,  **params):
+    def __init__(self, k = 4, **params):
         super(cbfs, self).__init__(**params)
         self.panels = []
-        self.loaded_files = []
-        self.chatbot_chain = load_db('Greeting.pdf', "stuff", 4)
+        self.loaded_files = [] # record loaded files
     
     # load files and create chatbot chain, manage memory
     def call_load_db(self, count):
         if count == 0 or not file_input.value and not url_input.value.strip():  # init or no file specified :
             return pn.pane.Markdown("No file or URL uploaded.")
         warning_message = ""
-
         if file_input.value:  # If user uploads a file
-            self.loaded_files = file_input.value
+            self.loaded_files.extend(file_input.value)
             warning_message += "⚠️ **The following files have been added:**\n- " + "\n- ".join(file_input.value) + "\n\n"
-            upload_button.button_style="outline"
+            # upload_button.button_style="outline"
         if url_input.value.strip():  # If user enters a web link
             self.loaded_files.append(url_input.value.strip())
             warning_message += "🌍 **The following URL has been added:**\n- " + url_input.value.strip() + "\n\n"
         try:
             for file_path in self.loaded_files:
-                self.chatbot_chain = load_db(file_path, "stuff", 4)
+                self.chatbot_chain = load_db(file_path)
                 upload_button.button_style="solid"
-
-            # self.clr_history()
-            # return pn.pane.Markdown(f"### Loaded Files:\n- " + "\n- ".join(self.loaded_files))
-            
-            self.clr_history()
-            # tab4[6] = pn.pane.Alert(warning_message)
-            return pn.pane.Alert(f"Loaded File: {self.loaded_files}")
+            self.loaded_files = []  # Clear the list of loaded files
+            # return pn.pane.Alert(f"Loaded File: {self.loaded_files}")
+            return pn.pane.Alert(warning_message)
         
         except Exception as e:
             return pn.pane.Alert(f"Error loading files: {e}")
@@ -136,10 +122,18 @@ class cbfs(param.Parameterized):
                     width=600
                     )
                 )
-        if not self.chatbot_chain:
-            return pn.pane.Markdown("No database loaded. Please upload a file or enter a URL in the 'Configure' tab.")
+        if vectordb._collection.count() == 0:
+            return pn.pane.Markdown("The database is empty. Please upload a file or enter a URL in the 'Configure' tab.")
         
-        result = self.chatbot_chain.invoke({"question": query, "chat_history": self.chat_history})
+        chatbot_chain = ConversationalRetrievalChain.from_llm(
+            llm=ChatOpenAI(model_name=llm_name, temperature=0), 
+            chain_type=CHAIN_TYPE, 
+            retriever=retriever, 
+            return_source_documents=True,
+            return_generated_question=True,
+        )
+        # invoke chatbot chain
+        result = chatbot_chain.invoke({"question": query, "chat_history": self.chat_history})
 
         # updata chat histroy and other state
         self.chat_history.extend([(query, result["answer"])])
@@ -147,6 +141,7 @@ class cbfs(param.Parameterized):
         self.db_response = result["source_documents"]
         self.answer = result['answer'] 
         
+        # Add the new conversation to the panels
         new_exchange = [
             pn.Row('User:', pn.pane.Markdown(query, width=600)),
             pn.Row('ChatBot:', pn.pane.Markdown(self.answer, width=600, styles={'background-color': '#F6F6F6'}))
@@ -164,12 +159,12 @@ class cbfs(param.Parameterized):
                 pn.Row(pn.pane.Markdown("### No Database Queries Yet", styles={'background-color': '#F6F6F6'})),
                 pn.layout.Divider(),
                 pn.Row(pn.pane.Str("You haven't asked any questions that required database retrieval."))
-            )
+                )
         return pn.Column(
             pn.Row(pn.pane.Markdown("### Last Database Query", styles={'background-color': '#F6F6F6'})),
             pn.layout.Divider(),
             pn.pane.Str(f"🔍 {self.db_query}")
-        )
+            )
 
     @param.depends('db_response', )
     def get_sources(self):
@@ -203,10 +198,12 @@ class cbfs(param.Parameterized):
     
     def clr_db(self, count = 0):
         # Remove all files in the vector store directory
-        if os.path.exists(DB_PATH):
+        print(f'{count}-------------')
+        if count == 1 and os.path.exists(DB_PATH):
             shutil.rmtree(DB_PATH)
+            print('--------clear---------')
             os.makedirs(DB_PATH, exist_ok=True)  # Recreate an empty directory
-        self.chatbot_chain = load_db('Greeting.pdf', "stuff", 4)
+        self.chatbot_chain = load_db(None)
 
 cb = cbfs()
 
@@ -228,7 +225,7 @@ button_clearhistory = pn.widgets.Button(name="Clear Chat History", button_type='
 button_clearhistory.on_click(cb.clr_history)
 
 ## function: clear database
-button_cleardb = pn.widgets.Button(name="Clear Database", button_type='danger')
+button_cleardb = pn.widgets.Button(name="Clear Database", button_type='warning')
 button_cleardb.on_click(cb.clr_db)
 
 ## function: input question
@@ -251,12 +248,13 @@ tab1 = pn.Column(
 )
 
 tab2= pn.Column(
-    button_cleardb,
+    pn.Row(button_cleardb, pn.pane.Markdown("Clear all memory and start fresh.")),
     pn.panel(cb.get_lquest),
     pn.layout.Divider(),
     pn.panel(cb.get_sources),
 )
 tab3= pn.Column(
+    pn.Row(button_clearhistory, pn.pane.Markdown("Clears chat history. Can use to start a new topic")),
     pn.panel(cb.get_chats),
     pn.layout.Divider(),
 )
@@ -269,12 +267,16 @@ tab4 = pn.Column(
     upload_button,  # The new button that uploads and triggers processing
     bound_button_load,
     pn.layout.Divider(),
-    pn.Row(button_clearhistory, pn.pane.Markdown("Clears chat history. Can use to start a new topic")),
 )
 
 dashboard = pn.Column(
-    pn.Row(pn.pane.Markdown('# ChatWithYourFiles_Bot')),
+    pn.Row(pn.pane.Markdown('# Chat With Your Files: AI Research Assistant', styles={'text-align': 'center', 'font-size': '1em', 'color': "#3B7FE6"})),
     pn.Tabs(('Conversation', tab1), ('Database', tab2), ('Chat History', tab3),('Configure', tab4))
 )
 
-dashboard.show()
+debug_mode = True  # Set debug mode to True for development
+
+if __name__ == "__main__":
+    # Option 1: Use pn.serve directly
+    pn.serve(dashboard, show=True, title="My Dashboard", autoreload=debug_mode)
+
